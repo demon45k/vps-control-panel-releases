@@ -106,6 +106,27 @@ port_holder() {
     ss -tlnpH "sport = :$1" 2>/dev/null | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p' | head -1
 }
 
+# have_tty reports whether there is a person to ask.
+#
+# Deliberately not `[ -t 0 ]`. The documented way to run this is
+# `curl … | sudo bash`, which makes stdin the script itself — so a stdin test
+# says "nobody is here" in exactly the case where somebody is, and the installer
+# silently skips both of its questions. That produced a panel with no
+# administrator account and no way to notice until you tried to sign in.
+#
+# The terminal is /dev/tty, which survives the pipe. Opening it is the test:
+# under cron or in a container there is none, and the answer is honestly no.
+have_tty() { [ -e /dev/tty ] && : >/dev/tty 2>/dev/null; }
+
+# ask prints a prompt and reads one line from the terminal, not from stdin.
+ask() {
+    local prompt="$1" reply=""
+    have_tty || return 1
+    printf '%s' "$prompt" >/dev/tty
+    IFS= read -r reply </dev/tty || return 1
+    printf '%s' "$reply"
+}
+
 # other_nginx_sites lists enabled vhosts that are neither ours nor Debian's
 # default. Used to tell "this machine's nginx, which we are about to configure"
 # from "somebody else's web server, which we must not take".
@@ -187,14 +208,13 @@ ok "${mem_mb} MB RAM, ${disk_mb} MB free on /"
 
 step "Panel address"
 
-if [ -z "$PANEL_DOMAIN" ]; then
-    if [ -t 0 ]; then
+if [ -z "$PANEL_DOMAIN" ] && have_tty; then
+    {
         printf '\n  Enter the domain this panel will be reached at (e.g. panel.example.com).\n'
         printf '  Leave blank to use this machine%s address with a self-signed certificate.\n' "'s"
         printf '  %sTip: set PANEL_DOMAIN=… in the environment to skip this prompt.%s\n' "$C_DIM" "$C_RESET"
-        printf '  > '
-        read -r PANEL_DOMAIN </dev/tty || PANEL_DOMAIN=""
-    fi
+    } >/dev/tty
+    PANEL_DOMAIN="$(ask '  > ' || true)"
 fi
 
 PRIMARY_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -nE 's/.* src ([0-9.]+).*/\1/p' | head -1)"
@@ -654,9 +674,9 @@ fi
 
 step "Administrator account and verification"
 
-if [ -z "$ADMIN_EMAIL" ] && [ -t 0 ]; then
-    printf '\n  Email address for the first administrator.\n  > '
-    read -r ADMIN_EMAIL </dev/tty || true
+if [ -z "$ADMIN_EMAIL" ] && have_tty; then
+    printf '\n  Email address for the first administrator.\n' >/dev/tty
+    ADMIN_EMAIL="$(ask '  > ' || true)"
 fi
 ADMIN_PASSWORD=""
 if [ -n "$ADMIN_EMAIL" ]; then
@@ -673,7 +693,10 @@ if [ -n "$ADMIN_EMAIL" ]; then
         fail "creating the administrator failed"
     fi
 else
-    warn "no administrator created — run: platformctl bootstrap --email you@example.com"
+    # Loud, because this is the difference between a working panel and one
+    # nobody can sign in to, and it is silent otherwise.
+    warn "no administrator was created — there is nothing to sign in with yet"
+    warn "run: sudo platformctl bootstrap --email you@example.com"
 fi
 
 printf '\n'
@@ -693,6 +716,9 @@ if [ -n "$ADMIN_PASSWORD" ]; then
     printf '    email:      %s\n' "$ADMIN_EMAIL"
     printf '    password:   %s%s%s\n' "$C_BOLD" "$ADMIN_PASSWORD" "$C_RESET"
     printf '  %sShown once. It is not stored anywhere and cannot be recovered.%s\n' "$C_WARN" "$C_RESET"
+else
+    printf '\n  %sNo sign-in yet — no administrator account exists.%s\n' "$C_WARN" "$C_RESET"
+    printf '    sudo platformctl bootstrap --email you@example.com\n'
 fi
 
 cat <<NEXT
