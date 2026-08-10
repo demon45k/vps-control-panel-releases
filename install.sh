@@ -177,10 +177,25 @@ ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 ok "Detected: ${PRETTY_NAME:-$ID $VERSION_ID}"
 ok "Architecture: $ARCH"
 
+# The deb family, because that is what the packages are. Debian 12 is the one
+# the platform has actually run on; the others are accepted and said to be
+# untested, which is the honest position — refusing them outright would be
+# claiming knowledge nobody has either way.
+#
+# No version numbers reach the software from here. The PHP the node serves is
+# whatever `php-fpm` resolves to on this distribution, and the node reports it
+# rather than being told; that is the whole of what multi-distribution support
+# needed on the deb side. An RPM distribution is a different question — it needs
+# its own packaging, its own paths and its own SELinux story — and PlanContext
+# is where those would go.
 case "${ID}${VERSION_ID:+ $VERSION_ID}" in
     "debian 12") ;;
-    "debian 13") warn "Debian 13 is not the tested target; continuing" ;;
-    *) fail "this platform installs on Debian 12. Found: ${PRETTY_NAME:-$ID}" ;;
+    "debian 13"|"ubuntu 22.04"|"ubuntu 24.04")
+        warn "${PRETTY_NAME:-$ID} is supported but not yet exercised on hardware" ;;
+    debian*|ubuntu*)
+        warn "${PRETTY_NAME:-$ID} is newer or older than anything tested; continuing" ;;
+    *) fail "this platform installs on Debian or Ubuntu. Found: ${PRETTY_NAME:-$ID}
+  An RPM-based distribution needs packaging that does not exist yet." ;;
 esac
 [ "$ARCH" = "amd64" ] || fail "only amd64 is supported. Found: $ARCH"
 
@@ -464,7 +479,12 @@ retired_key_files = []
 backup_key_file = "/etc/platform/secrets/backup.key"
 
 [hosting]
-php_versions = ["8.2", "8.3"]
+# Left empty on purpose. This is the fallback offer for a node that has not
+# reported its stack yet; every node that has reported says which PHP versions
+# it actually carries, and a guess written here would be offered to a customer
+# whose node cannot serve it. Step 14 fills it in from what is really installed
+# when this machine is also a hosting node.
+php_versions = []
 TOML
 
 cat > /etc/platform/worker.toml <<'TOML'
@@ -741,7 +761,24 @@ else
         [ "$(dpkg-query -W -f='${Status}' "$name" 2>/dev/null)" = "install ok installed" ] \
             || fail "$name did not install. See $LOG"
     done
-    ok "hosting node installed: nginx, PHP-FPM, MariaDB, agent and helper"
+    # What the distribution actually gave us. A version counts as present when
+    # its pool directory exists, because that is exactly the directory a
+    # customer's pool is written into — the same test the node's own capability
+    # report uses, so the fallback and the report cannot disagree.
+    php_found=""
+    for dir in /etc/php/*/fpm/pool.d; do
+        [ -d "$dir" ] || continue
+        v="${dir#/etc/php/}"; v="${v%%/*}"
+        php_found="$php_found${php_found:+, }\"$v\""
+    done
+    [ -n "$php_found" ] || fail "php-fpm installed but no /etc/php/*/fpm/pool.d exists"
+    run sed -i "s|^php_versions = .*|php_versions = [$php_found]|" /etc/platform/controller.toml \
+        || fail "recording the installed PHP versions failed"
+    # The controller read the empty list at step 13. It is the process that
+    # hands a node its supported versions, so it has to read the file again
+    # before the node enrols against it.
+    run systemctl restart platform-controller || fail "restarting the controller failed"
+    ok "hosting node installed: nginx, PHP $(echo "$php_found" | tr -d '"'), MariaDB, agent and helper"
 
     # Everything from here — the token, the CSR, the units, waiting for the node
     # to report in — is platformctl's, not a second copy of it living in a shell
