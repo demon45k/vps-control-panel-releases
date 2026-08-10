@@ -129,7 +129,11 @@ port_holder() {
 #
 # The terminal is /dev/tty, which survives the pipe. Opening it is the test:
 # under cron or in a container there is none, and the answer is honestly no.
-have_tty() { [ -e /dev/tty ] && : >/dev/tty 2>/dev/null; }
+# The braces matter. In `: >/dev/tty 2>/dev/null` the redirections are applied
+# left to right, so opening /dev/tty fails before stderr has been silenced and
+# the shell prints "No such device or address" into the install log — which is
+# alarming, in the middle of a step that is working correctly.
+have_tty() { { [ -e /dev/tty ] && : >/dev/tty; } 2>/dev/null; }
 
 # ask prints a prompt and reads one line from the terminal, not from stdin.
 ask() {
@@ -280,9 +284,37 @@ export DEBIAN_FRONTEND=noninteractive
 
 # A machine this young is usually still running cloud-init's own package pass,
 # which holds the dpkg lock. Ask cloud-init first — it knows when it is done.
-if command -v cloud-init >/dev/null 2>&1; then
+#
+# Unless cloud-init is what started this. Then waiting for it to finish is
+# waiting for a process that is waiting for us: the install stops at 26% with
+# "waiting for cloud-init to finish its own package work" and stays there
+# forever. Running an installer from user-data is the ordinary way to build a
+# machine on any cloud, so this is not an exotic case — it is the main one.
+#
+# Answered by walking our own ancestry rather than by asking cloud-init whether
+# it is running, because it *is* running and that is not the question. The
+# question is whether it is above us.
+under_cloud_init() {
+    local pid=$$ comm depth=0
+    while [ "$pid" -gt 1 ] && [ "$depth" -lt 32 ]; do
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+        case "$comm" in cloud-init*) return 0 ;; esac
+        pid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)"
+        [ -n "$pid" ] || pid=1
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
+if ! command -v cloud-init >/dev/null 2>&1; then
+    :
+elif under_cloud_init; then
+    info "started by cloud-init; not waiting for it to finish"
+else
     info "waiting for cloud-init to finish its own package work"
-    cloud-init status --wait >/dev/null 2>&1 || true
+    # Bounded even so. A wait that cannot end is worse than a lock contended
+    # for: the lock retry below handles a busy dpkg, and nothing handles a hang.
+    timeout 600 cloud-init status --wait >/dev/null 2>&1 || true
 fi
 
 # And then retry regardless, because cloud-init is not the only thing that takes
