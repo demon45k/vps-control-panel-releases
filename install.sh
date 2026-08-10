@@ -808,6 +808,17 @@ if [ -n "$ADMIN_EMAIL" ]; then
             ok "an account for $ADMIN_EMAIL already existed; nothing was changed"
         else
             ok "administrator $ADMIN_EMAIL created"
+            # Nobody is watching an unattended install. The password is printed
+            # below and that is enough for a person at a terminal; a cloud-init
+            # run prints into a log file instead, which is both harder to find
+            # and no more private. So it is written where whatever started this
+            # install can collect it, and told to remove it afterwards.
+            if ! have_tty; then
+                umask 077
+                printf '%s\n' "$ADMIN_PASSWORD" > /root/platform-admin-password
+                chmod 0600 /root/platform-admin-password
+                ok "password written to /root/platform-admin-password (delete it once collected)"
+            fi
         fi
     else
         fail "creating the administrator failed"
