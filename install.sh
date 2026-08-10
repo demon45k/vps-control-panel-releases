@@ -33,7 +33,20 @@ DB_NAME="${PLATFORM_DB_NAME:-platform}"
 DB_USER="${PLATFORM_DB_USER:-platform}"
 LOG="/var/log/platform-install.log"
 
-TOTAL_STEPS=14
+# Whether this machine also serves customer websites.
+#
+# Default yes, because the thing being installed is a hosting business and a
+# panel that can sell web hosting with nowhere to build it is half a product.
+# Somebody opening a VPS company buys one server; requiring a second before
+# they have a customer is requiring them to go elsewhere.
+#
+# It is a decision, not a default nobody sees: the step says what it costs, and
+# PLATFORM_HOSTING_HERE=no declines it. Declining costs nothing later —
+# `platformctl hosting enable-here` does the same thing on any day, and a
+# separate node needs no change here at all.
+HOSTING_HERE="${PLATFORM_HOSTING_HERE:-}"
+
+TOTAL_STEPS=15
 STEP=0
 START=$(date +%s)
 
@@ -130,10 +143,21 @@ ask() {
 # other_nginx_sites lists enabled vhosts that are neither ours nor Debian's
 # default. Used to tell "this machine's nginx, which we are about to configure"
 # from "somebody else's web server, which we must not take".
+#
+# A customer's site is ours too. On a single-machine deployment the panel and
+# the customers share one nginx, so by the second re-run this directory is full
+# of vhosts the platform itself wrote — and refusing to re-run because the
+# platform is doing its job would be the worst kind of guard. Every generated
+# vhost opens with a marker line; anything carrying it is not somebody else's.
 other_nginx_sites() {
     [ -d /etc/nginx/sites-enabled ] || return 0
-    find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 \
-        ! -name default ! -name platform -printf '%f ' 2>/dev/null
+    for site in /etc/nginx/sites-enabled/*; do
+        [ -e "$site" ] || continue
+        name="$(basename "$site")"
+        case "$name" in default|platform) continue ;; esac
+        head -n 1 "$site" 2>/dev/null | grep -q '^# Managed by platform' && continue
+        printf '%s ' "$name"
+    done
 }
 
 # ------------------------------------------------------------------------ start
@@ -299,8 +323,10 @@ fi
   PLATFORM_PACKAGE_DIR=<directory of .deb files>"
 
 info "Installing packages from $PACKAGE_DIR"
-# The control-plane set only. Agents belong on nodes and installing them here
-# would create service accounts for daemons this machine will never run.
+# The control-plane set. The Proxmox agent is never installed here — it belongs
+# on a hypervisor, and this machine is refused as one. The hosting agent is a
+# separate question answered in step 14, because this machine may legitimately
+# serve websites too.
 pkgs=""
 for name in platform-cli platform-api platform-controller platform-worker \
             platform-scheduler platform-console-proxy; do
@@ -670,7 +696,64 @@ if [ -x /usr/bin/platform-db-backup ]; then
     ok "nightly database dump at 03:20, 14-day retention"
 fi
 
-# ------------------------------------------------------- 14. the administrator
+# ----------------------------------------------------------- 14. web hosting
+
+step "Web hosting on this machine"
+
+# Asked only where there is somebody to ask. A piped install has no terminal and
+# gets the default, which is stated rather than assumed silently.
+if [ -z "$HOSTING_HERE" ]; then
+    if have_tty; then
+        printf '\n  This machine can serve customer websites as well as run the panel:\n' >/dev/tty
+        printf '  one server for the whole product. Customer PHP would then run\n' >/dev/tty
+        printf '  alongside the database and the Proxmox token — right for one server,\n' >/dev/tty
+        printf '  wrong for twenty, and movable to its own node later at no cost.\n\n' >/dev/tty
+        printf '  Serve websites here? [Y/n] ' >/dev/tty
+        reply="$(ask '' || true)"
+        case "$reply" in [Nn]*) HOSTING_HERE=no ;; *) HOSTING_HERE=yes ;; esac
+    else
+        HOSTING_HERE=yes
+        info "no terminal to ask: serving websites here (PLATFORM_HOSTING_HERE=no declines)"
+    fi
+fi
+
+if [ "$HOSTING_HERE" = "no" ]; then
+    ok "not serving websites here; run 'platformctl hosting enable-here' to change that"
+else
+    # platform-hosting-node names what a website needs — nginx, PHP-FPM,
+    # MariaDB — so this script does not. dpkg leaves them unconfigured and
+    # `apt-get -f install` fetches them from the distribution; the list lives in
+    # one place, where dpkg checks it, rather than here where nothing does.
+    hpkgs=""
+    for name in platform-hosting-helper platform-hosting-agent platform-hosting-node; do
+        p="$(ls "$PACKAGE_DIR"/${name}_*.deb 2>/dev/null | head -1)"
+        [ -n "$p" ] || fail "$name is missing from $PACKAGE_DIR"
+        hpkgs="$hpkgs $p"
+    done
+    info "Installing the hosting node and its web stack"
+    # shellcheck disable=SC2086
+    dpkg -i $hpkgs >>"$LOG" 2>&1 || true
+    apt_retry -f install -y -qq || fail "installing the hosting node failed"
+    # dpkg -i is allowed to fail above — it always does when a dependency is not
+    # yet present — so the check that matters is whether the packages ended up
+    # configured, not what dpkg returned.
+    for name in platform-hosting-helper platform-hosting-agent platform-hosting-node; do
+        [ "$(dpkg-query -W -f='${Status}' "$name" 2>/dev/null)" = "install ok installed" ] \
+            || fail "$name did not install. See $LOG"
+    done
+    ok "hosting node installed: nginx, PHP-FPM, MariaDB, agent and helper"
+
+    # Everything from here — the token, the CSR, the units, waiting for the node
+    # to report in — is platformctl's, not a second copy of it living in a shell
+    # script. A local node enrols the way a remote one does.
+    if platformctl hosting enable-here --yes >>"$LOG" 2>&1; then
+        ok "this machine is enrolled as a hosting node"
+    else
+        fail "enrolling this machine as a hosting node failed. See $LOG"
+    fi
+fi
+
+# ------------------------------------------------------- 15. the administrator
 
 step "Administrator account and verification"
 
@@ -711,6 +794,11 @@ printf '%s└──────────────────────�
 
 printf '  %sVersion:%s      %s\n' "$C_DIM" "$C_RESET" "$VERSION"
 printf '  %sPanel:%s        https://%s/\n' "$C_DIM" "$C_RESET" "$PANEL_HOST"
+if [ "$HOSTING_HERE" = "no" ]; then
+    printf '  %sHosting:%s      on its own node — none enrolled yet\n' "$C_DIM" "$C_RESET"
+else
+    printf '  %sHosting:%s      on this machine (%s)\n' "$C_DIM" "$C_RESET" "$(hostname)"
+fi
 if [ -n "$ADMIN_PASSWORD" ]; then
     printf '\n  %sSign in with:%s\n' "$C_BOLD" "$C_RESET"
     printf '    email:      %s\n' "$ADMIN_EMAIL"
@@ -747,7 +835,11 @@ cat <<NEXT
        Four pieces, one copy each. Losing them loses every certificate, every
        sealed backup and the CA every node trusts. Do this before you sell
        anything.
-    3. Register a Proxmox cluster, then run preflight again.
+    3. Register a Proxmox cluster, then run preflight again. Until one is
+       registered this deployment can sell web hosting and nothing else —
+       machines and containers are built on Proxmox.
+    4. Create something to sell: platformctl catalog product / plan / price,
+       or the catalogue screen in the panel.
 NEXT
 
 if [ -z "$PANEL_DOMAIN" ]; then
