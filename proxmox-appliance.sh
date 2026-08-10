@@ -41,7 +41,64 @@ ok()   { printf '  %s✓%s %s\n' "$C_OK" "$C_RESET" "$*"; }
 warn() { printf '  %s!%s %s\n' "$C_WARN" "$C_RESET" "$*"; }
 fail() { printf '\n  %s✗ %s%s\n\n' "$C_ERR" "$*" "$C_RESET" >&2; exit 1; }
 
+# The first-boot instructions, as a function so they can be printed and
+# checked without a Proxmox host anywhere near them.
+emit_user_data() {
+        echo "#cloud-config"
+        echo "hostname: $NAME"
+        echo "manage_etc_hosts: true"
+        echo "package_update: true"
+        echo "packages: [qemu-guest-agent, curl, ca-certificates]"
+        echo "users:"
+        echo "  - name: platform"
+        echo "    sudo: ALL=(ALL) NOPASSWD:ALL"
+        echo "    shell: /bin/bash"
+        echo "    lock_passwd: false"
+        echo "    passwd: '$CONSOLE_HASH'"
+        if [ -n "$SSH_KEY" ]; then
+            echo "    ssh_authorized_keys: ['$SSH_KEY']"
+        fi
+        echo "runcmd:"
+        echo "  - systemctl enable --now qemu-guest-agent"
+        # The marker files are how the host watches without guessing: one when the
+        # install starts, one when it ends, and the exit status in it. Polling for
+        # "is the panel answering yet" would report success for a panel that is up
+        # and an install that failed halfway.
+        echo "  - [ sh, -c, 'touch /root/.platform-install-started' ]"
+        # Said on the console too, so somebody watching `qm terminal` sees progress
+        # rather than a blank screen — which is all the guest offers when the agent
+        # never comes up, and the agent never comes up when the network is broken.
+        echo "  - [ sh, -c, 'echo \"platform: fetching the installer\" > /dev/console' ]"
+        # Fetched with python3, which cloud-init itself is written in and which is
+        # therefore certainly present, rather than with curl, which is installed by
+        # the apt run three lines above. A bootstrap step that depends on the step
+        # before it having worked is a bootstrap step that fails silently the one
+        # time it matters.
+        echo "  - [ sh, -c, 'python3 -c \"import urllib.request;open(\\\"/root/install.sh\\\",\\\"wb\\\").write(urllib.request.urlopen(\\\"$RELEASES/install.sh\\\").read())\" >> /root/platform-install.out 2>&1' ]"
+        # Downloaded to a file and then run, rather than piped. In "VAR=x curl … |
+        # bash" the variable is set for curl and for nothing else, so the installer
+        # ran with no administrator email and created no account to sign in with.
+        echo "  - [ sh, -c, 'PLATFORM_ADMIN_EMAIL=$ADMIN_EMAIL bash /root/install.sh >> /root/platform-install.out 2>&1; echo \$? > /root/.platform-install-done' ]"
+        echo "  - [ sh, -c, 'echo \"platform: install finished with \$(cat /root/.platform-install-done)\" > /dev/console' ]"
+}
+
 # ------------------------------------------------------------------ refuse early
+
+# Print the first-boot instructions and stop, without touching anything.
+#
+# For an operator who wants to read what will run on their machine before it
+# runs, and for CI, which parses the result: cloud-init silently does nothing at
+# all when its input is malformed, and "nothing happened and the guest never
+# came up" is indistinguishable from a broken network. A generator whose output
+# is never parsed is a generator nobody has checked.
+if [ -n "${PLATFORM_PRINT_USER_DATA:-}" ]; then
+    NAME="${NAME:-platform-panel}"
+    ADMIN_EMAIL="${ADMIN_EMAIL:-you@example.com}"
+    CONSOLE_PASSWORD="not-generated-in-this-mode"
+    CONSOLE_HASH='$6$example$hash'
+    emit_user_data
+    exit 0
+fi
 
 [ "$(id -u)" -eq 0 ] || fail "run this as root on the Proxmox host"
 
@@ -54,11 +111,34 @@ command -v qm >/dev/null 2>&1 || fail "this runs on a Proxmox VE host: qm was no
 # Storage: whatever the operator said, or the first one that can hold a disk.
 # Guessed rather than demanded, because a first-time operator does not yet know
 # what their storages are called, and the guess is stated so it can be corrected.
+#
+# Local before networked, and that ordering is the point rather than a detail.
+# "The first active storage" put the panel's disk on an NFS export from a NAS
+# that had crashed the day before — the machine that runs the billing database
+# and holds the cluster's credentials, depending for every write on a box that
+# is not part of the cluster. A control plane must not share fate with
+# something it does not manage.
+pick_storage() {
+    local want
+    for want in lvmthin zfspool btrfs dir lvm; do
+        pvesm status -content images 2>/dev/null |
+            awk -v t="$want" 'NR>1 && $2==t && $3=="active" {print $1; exit}'
+    done | head -1
+}
 if [ -z "$STORAGE" ]; then
-    STORAGE="$(pvesm status -content images 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}')"
-    [ -n "$STORAGE" ] || fail "no active storage can hold a VM disk.
+    STORAGE="$(pick_storage)"
+    if [ -n "$STORAGE" ]; then
+        say "storage: $STORAGE ${C_DIM}(local; PLATFORM_STORAGE to choose another)${C_RESET}"
+    else
+        # Nothing local. Networked storage is allowed rather than refused — a
+        # cluster may genuinely have only shared storage — but it is said out
+        # loud, because it is a decision and not a detail.
+        STORAGE="$(pvesm status -content images 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}')"
+        [ -n "$STORAGE" ] || fail "no active storage can hold a VM disk.
   Name one with PLATFORM_STORAGE=<storage>."
-    say "storage: $STORAGE ${C_DIM}(PLATFORM_STORAGE to choose another)${C_RESET}"
+        warn "storage: $STORAGE — this is not local to this node."
+        warn "The panel will depend on it for every write. Local storage is better."
+    fi
 fi
 
 # Snippets are how cloud-init is given a file rather than a handful of options,
@@ -123,28 +203,24 @@ SNIPPET_DIR="$SNIPPET_BASE/snippets"
 mkdir -p "$SNIPPET_DIR"
 USERDATA="$SNIPPET_DIR/platform-$VMID-user-data.yml"
 
-{
-    echo "#cloud-config"
-    echo "hostname: $NAME"
-    echo "manage_etc_hosts: true"
-    echo "package_update: true"
-    echo "packages: [qemu-guest-agent, curl, ca-certificates]"
-    echo "users:"
-    echo "  - name: platform"
-    echo "    sudo: ALL=(ALL) NOPASSWD:ALL"
-    echo "    shell: /bin/bash"
-    if [ -n "$SSH_KEY" ]; then
-        echo "    ssh_authorized_keys: ['$SSH_KEY']"
-    fi
-    echo "runcmd:"
-    echo "  - systemctl enable --now qemu-guest-agent"
-    # The marker files are how the host watches without guessing: one when the
-    # install starts, one when it ends, and the exit status in it. Polling for
-    # "is the panel answering yet" would report success for a panel that is up
-    # and an install that failed halfway.
-    echo "  - [ sh, -c, 'touch /root/.platform-install-started' ]"
-    echo "  - [ sh, -c, 'PLATFORM_ADMIN_EMAIL=$ADMIN_EMAIL curl -fsSL $RELEASES/install.sh | bash > /root/platform-install.out 2>&1; echo \$? > /root/.platform-install-done' ]"
-} > "$USERDATA"
+# A console password, and it is not optional.
+#
+# Debian's cloud image has root locked and no password anywhere: the intended
+# way in is an SSH key. Built without one, the first version of this script
+# produced a machine that could fail and then could not be looked at — the
+# install did not finish, and the operator had a serial console with no
+# credentials for it. A recovery path that only exists when nothing went wrong
+# is not a recovery path.
+#
+# Hashed here rather than written in the clear, because the snippet is a file
+# on shared storage that outlives the install.
+CONSOLE_PASSWORD="$(head -c 18 /dev/urandom | base64 | tr -d '+/=' | cut -c1-20)"
+CONSOLE_HASH="$(openssl passwd -6 "$CONSOLE_PASSWORD" 2>/dev/null)" \
+    || fail "openssl could not hash the console password"
+
+
+emit_user_data > "$USERDATA"
+chmod 0600 "$USERDATA"
 ok "first-boot instructions written"
 
 # ------------------------------------------------------------------ the machine
@@ -199,8 +275,34 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 10
 done
 
-[ "$state" = "done" ] || fail "the install did not finish within fifteen minutes.
-  Look inside:  qm terminal $VMID   (then: cat /root/platform-install.out)"
+if [ "$state" != "done" ]; then
+    # Two different failures wearing the same timeout, and telling them apart is
+    # the difference between one command and an evening. If the agent never
+    # answered, nothing inside ever ran and the guest almost certainly has no
+    # network; if it answered and the install did not finish, the installer is
+    # the thing to read.
+    printf '\n'
+    if [ "$state" = "booting" ]; then
+        warn "the guest never answered: qemu-guest-agent is not running in VM $VMID."
+        warn "It is installed by apt on first boot, so this usually means the VM"
+        warn "has no working network — the same thing that stops the installer."
+        printf '\n  %sCheck, from inside:%s\n' "$C_BOLD" "$C_RESET"
+        printf '    ip -br addr        does it have an address on %s?\n' "$BRIDGE"
+        printf '    ip route           is there a default route?\n'
+        printf '    getent hosts deb.debian.org    does DNS answer?\n'
+    else
+        warn "the guest is up and the installer did not finish within fifteen minutes."
+        printf '\n  %sRead the log, from inside:%s\n' "$C_BOLD" "$C_RESET"
+        printf '    cat /root/platform-install.out\n'
+        printf '    cat /var/log/cloud-init-output.log\n'
+    fi
+    printf '\n  %sGet in:%s\n' "$C_BOLD" "$C_RESET"
+    printf '    qm terminal %s      %s(Ctrl+O to leave)%s\n' "$VMID" "$C_DIM" "$C_RESET"
+    printf '    user: platform   password: %s%s%s\n\n' "$C_BOLD" "$CONSOLE_PASSWORD" "$C_RESET"
+    printf '  %sStart over:%s  qm stop %s && qm destroy %s\n\n' \
+        "$C_BOLD" "$C_RESET" "$VMID" "$VMID"
+    exit 1
+fi
 
 status="$(guest_out cat /root/.platform-install-done | tr -dc '0-9')"
 if [ "${status:-1}" != "0" ]; then
@@ -242,6 +344,10 @@ cat <<NEXT
     3. Escrow the keys — inside the VM: platform-escrow-keys /root/keys.tar.gz.gpg
 
   ${C_BOLD}The VM${C_RESET}
-    console:  qm terminal $VMID
+    console:  qm terminal $VMID        ${C_DIM}(Ctrl+O to leave)${C_RESET}
+    login:    platform / $CONSOLE_PASSWORD
     log:      /root/platform-install.out inside it
+
+  That console login is for this machine's own shell, not for the panel. It is
+  shown here because a machine you cannot get into is a machine you cannot fix.
 NEXT
