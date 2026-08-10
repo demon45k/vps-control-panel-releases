@@ -257,23 +257,59 @@ ok "started"
 say ""
 say "installing — this takes about five minutes"
 
-guest() { qm guest exec "$VMID" -- "$@" 2>/dev/null; }
-guest_out() { guest "$@" | sed -n 's/.*"out-data" : "\(.*\)"/\1/p' | head -1; }
+guest() { qm guest exec "$VMID" --timeout 30 -- "$@" 2>/dev/null; }
+
+# `qm guest exec` exits 0 whenever the agent *ran* the command. Its own status
+# says the guest is reachable and nothing else; what the command returned is in
+# the JSON it prints.
+#
+# Reading the wrong one of those said "the install has finished" the moment the
+# agent came up, and then reported a failure for a file that did not exist yet —
+# while the install was still running perfectly well inside.
+guest_rc() {
+    guest "$@" | sed -n 's/.*"exitcode"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -1
+}
+guest_out() {
+    guest "$@" | sed -n 's/.*"out-data"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | head -1
+}
+# The agent is up when it can run the simplest command there is and say so.
+agent_up() { [ "$(guest_rc true)" = "0" ]; }
 
 # The agent answers only once the guest has booted and installed it, so the
 # first minute of silence is expected rather than a fault.
 deadline=$(( $(date +%s) + 900 ))
 state="booting"
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    if guest test -f /root/.platform-install-done >/dev/null 2>&1; then
+    if [ "$(guest_rc test -f /root/.platform-install-done)" = "0" ]; then
         state="done"; break
     fi
-    if [ "$state" = "booting" ] && guest test -f /root/.platform-install-started >/dev/null 2>&1; then
+    if [ "$state" = "booting" ] && agent_up; then
         state="installing"
         ok "guest is up; the platform installer is running"
     fi
     sleep 10
 done
+
+# show_log prints a file from inside the guest, turning the agent's JSON escapes
+# back into text. "Look inside with qm terminal" is an instruction; this is the
+# answer, and the agent that would carry the instruction can carry the answer.
+show_log() {
+    local file="$1" lines="$2" body
+    body="$(guest_out sh -c "tail -n $lines $file 2>&1" || true)"
+    [ -n "$body" ] || return 1
+    printf '\n  %s%s (last %s lines)%s\n' "$C_BOLD" "$file" "$lines" "$C_RESET"
+    printf '%s\n' "$body" | sed 's/\\n/\n/g; s/\\"/"/g; s/^/    /'
+}
+
+# credentials is printed by every path that leaves a machine behind. A failure
+# that does not hand over the way in is a failure somebody has to escalate.
+credentials() {
+    printf '\n  %sGet in:%s\n' "$C_BOLD" "$C_RESET"
+    printf '    qm terminal %s      %s(Ctrl+O to leave)%s\n' "$VMID" "$C_DIM" "$C_RESET"
+    printf '    user: platform   password: %s%s%s\n' "$C_BOLD" "$CONSOLE_PASSWORD" "$C_RESET"
+    printf '\n  %sStart over:%s  qm stop %s && qm destroy %s\n\n' \
+        "$C_BOLD" "$C_RESET" "$VMID" "$VMID"
+}
 
 if [ "$state" != "done" ]; then
     # Two different failures wearing the same timeout, and telling them apart is
@@ -292,22 +328,22 @@ if [ "$state" != "done" ]; then
         printf '    getent hosts deb.debian.org    does DNS answer?\n'
     else
         warn "the guest is up and the installer did not finish within fifteen minutes."
-        printf '\n  %sRead the log, from inside:%s\n' "$C_BOLD" "$C_RESET"
-        printf '    cat /root/platform-install.out\n'
-        printf '    cat /var/log/cloud-init-output.log\n'
+        show_log /root/platform-install.out 40 || \
+            warn "there is no /root/platform-install.out: the installer never started."
+        show_log /var/log/cloud-init-output.log 20 || true
     fi
-    printf '\n  %sGet in:%s\n' "$C_BOLD" "$C_RESET"
-    printf '    qm terminal %s      %s(Ctrl+O to leave)%s\n' "$VMID" "$C_DIM" "$C_RESET"
-    printf '    user: platform   password: %s%s%s\n\n' "$C_BOLD" "$CONSOLE_PASSWORD" "$C_RESET"
-    printf '  %sStart over:%s  qm stop %s && qm destroy %s\n\n' \
-        "$C_BOLD" "$C_RESET" "$VMID" "$VMID"
+    credentials
     exit 1
 fi
 
 status="$(guest_out cat /root/.platform-install-done | tr -dc '0-9')"
 if [ "${status:-1}" != "0" ]; then
-    fail "the platform installer failed inside the VM (exit ${status:-unknown}).
-  Look inside:  qm terminal $VMID   (then: cat /root/platform-install.out)"
+    printf '\n'
+    warn "the platform installer failed inside VM $VMID (exit ${status:-unknown})."
+    show_log /root/platform-install.out 40 || \
+        warn "there is no /root/platform-install.out: the installer never started."
+    credentials
+    exit 1
 fi
 ok "platform installed"
 
